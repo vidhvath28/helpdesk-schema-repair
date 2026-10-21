@@ -10,6 +10,37 @@ When you're done, all 36 pgTAP tests must pass.
 
 ---
 
+## ERD-to-Schema Decisions
+
+### Decision 1: `comments.internal` is `BOOLEAN`, and every enum column is `TEXT` + `CHECK`
+ERD said: `boolean internal "visible to agents only"`, and `plan`, `role`, `priority` and `status` are strings limited to a fixed list (e.g. `"low|medium|high|urgent"`).
+Schema decided: `internal BOOLEAN NOT NULL DEFAULT FALSE` (the draft had `TEXT DEFAULT 'false'`). Each enum column is `TEXT NOT NULL CHECK (col IN (...))`, not a PostgreSQL `ENUM` type.
+Reason: As `TEXT`, `internal` accepts `'false'`, `'False'`, `'no'` and `'0'`. A check like `WHERE internal = 'true'` then misses rows, and an agent-only note can be shown to a customer. `BOOLEAN` allows only true or false. For the enum columns, `TEXT` + `CHECK` rejects any value outside the list, like an `ENUM` does. But adding a status such as `escalated` next year is one `ALTER TABLE ... CHECK` statement, while removing a value from a PostgreSQL `ENUM` is awkward.
+
+### Decision 2: `tickets.created_by` is `ON DELETE RESTRICT`, and `tickets.assignee_id` is `ON DELETE SET NULL`
+ERD said: `Agent ||--o{ Ticket : "created_by"` (required), and `Agent o|--o{ Ticket : "assigned to"` (optional). The diagram doesn't say what happens when that agent is deleted.
+Schema decided: `created_by UUID NOT NULL REFERENCES agents(id) ON DELETE RESTRICT` and `assignee_id UUID REFERENCES agents(id) ON DELETE SET NULL`.
+Reason: Who filed a ticket is permanent audit history, so deleting an agent who filed tickets is refused. Agents leave through `deactivated_at` instead, which keeps the record. The assignee is only the current owner. If that agent is deleted, the ticket stays open and goes back to unassigned, where another agent can pick it up. With `CASCADE`, deleting an agent would silently delete customers' tickets. Checked against a live database: deleting the assigned agent left the ticket with `assignee_id = NULL`.
+
+### Decision 3: `tickets.status` has a schema-level `DEFAULT 'open'`, and every `created_at` defaults to `NOW()`
+ERD said: `status "open|pending|resolved|closed"` and `timestamp created_at`. A diagram can't show defaults.
+Schema decided: `status TEXT NOT NULL DEFAULT 'open' CHECK (...)`. Every `created_at` / `added_at` is `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, and `internal` defaults to `FALSE`.
+Reason: If the default only lives in application code, a support script, a data import or a direct `INSERT` skips it. The row then either fails `NOT NULL` or gets no status at all. A schema default means every new ticket starts as `open` and gets a server-set creation time, however the row is written. `TIMESTAMPTZ` stores the exact moment, so a ticket filed at 09:00 in London shows the correct local time to a supervisor in New York.
+
+## Rejected Table Shape
+
+### Shape: `tickets.tags TEXT[]` (tags stored as an array on each ticket)
+What it was: `ALTER TABLE tickets ADD COLUMN tags TEXT[];`, a list of tag words on each ticket row.
+Why rejected: The ERD models tags as their own entity (`Tag`, owned by an organization, with a `color_hex`), joined to tickets many-to-many through `TicketTag`, which records `added_by` and `added_at`. An array can't hold any of that. A tag has no identity, no colour and no owner, and nothing records who applied it or when. Replaced by `tags` (`UNIQUE (org_id, name)`) and `ticket_tags` (`UNIQUE (ticket_id, tag_id)`), both with foreign keys.
+What would break:
+- **Renames:** renaming `billing` to `payments` means rewriting every ticket that has it.
+- **Typos:** nothing stops a typo such as `biling`, so reports by tag quietly undercount.
+- **Deleting a tag:** this can't remove it from tickets, because there is no foreign key to cascade.
+- **Slow queries:** "all tickets tagged urgent-customer" scans arrays instead of using an index on `ticket_tags(tag_id)`.
+- **Lost audit trail:** the ERD's `added_by` / `added_at` record has nowhere to live.
+
+---
+
 ## Prerequisites
 
 Make sure you have the following installed before starting:
@@ -206,31 +237,7 @@ git commit -m "fix: repair helpdesk schema to match ERD"
 
 2. Update `README.md` (this file) with exactly **3 ERD-to-schema decisions** and **1 rejected table shape** using this format:
 
-```markdown
-## ERD-to-Schema Decisions
-
-### Decision 1: [Column type decision]
-ERD said: ...
-Schema decided: ...
-Reason: ...
-
-### Decision 2: [ON DELETE decision]
-ERD said: ...
-Schema decided: ...
-Reason: ...
-
-### Decision 3: [Default value decision]
-ERD said: ...
-Schema decided: ...
-Reason: ...
-
-## Rejected Table Shape
-
-### Shape: [name what you removed or rejected]
-What it was: ...
-Why rejected: ...
-What would break: ...
-```
+_Done: see [ERD-to-Schema Decisions](#erd-to-schema-decisions) and [Rejected Table Shape](#rejected-table-shape) near the top of this README._
 
 3. Push and open a PR:
 ```bash
